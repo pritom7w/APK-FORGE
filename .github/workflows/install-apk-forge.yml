@@ -1,0 +1,138 @@
+name: Install and Deploy APK FORGE
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_deploy:
+        description: Type DEPLOY to extract the ZIP, install dependencies, and deploy
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  install-and-deploy:
+    if: ${{ inputs.confirm_deploy == 'DEPLOY' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v4
+
+      - name: Check and extract the uploaded starter ZIP
+        run: |
+          set -euo pipefail
+          test -f APK-FORGE-STARTER.zip || { echo 'APK-FORGE-STARTER.zip is missing from the repository root.'; exit 1; }
+          mkdir -p /tmp/apk-forge-package
+          unzip -q APK-FORGE-STARTER.zip -d /tmp/apk-forge-package
+          test -f /tmp/apk-forge-package/cloudflare-worker/wrangler.toml
+          test -f /tmp/apk-forge-package/.github/workflows/android-build.yml
+          cp -a /tmp/apk-forge-package/. .
+          rm -f APK-FORGE-STARTER.zip
+
+      - name: Set Git identity and save extracted project files to GitHub
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No repository file changes to commit.'
+          else
+            git commit -m 'Install APK FORGE backend and Android build workflow'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install all backend dependencies
+        working-directory: cloudflare-worker
+        run: npm install
+
+      - name: Configure Cloudflare account and Netlify website
+        working-directory: cloudflare-worker
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          NETLIFY_ORIGIN: ${{ secrets.ALLOWED_ORIGIN }}
+        run: |
+          set -euo pipefail
+          test -n "$CF_ACCOUNT_ID" || { echo 'Missing CLOUDFLARE_ACCOUNT_ID repository secret.'; exit 1; }
+          test -n "$NETLIFY_ORIGIN" || { echo 'Missing ALLOWED_ORIGIN repository secret.'; exit 1; }
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path('wrangler.toml')
+          text = p.read_text()
+          text = text.replace('YOUR_CLOUDFLARE_ACCOUNT_ID', os.environ['CF_ACCOUNT_ID'])
+          text = text.replace('https://YOUR-NETLIFY-SITE.netlify.app', os.environ['NETLIFY_ORIGIN'])
+          p.write_text(text)
+          PY
+
+      - name: Create private R2 bucket if needed
+        working-directory: cloudflare-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! npx wrangler r2 bucket create apk-forge-storage > /tmp/apk-forge-r2.log 2>&1; then
+            if grep -Eqi 'already exists|already in use|10006' /tmp/apk-forge-r2.log; then
+              echo 'The R2 bucket already exists. Continuing.'
+            else
+              cat /tmp/apk-forge-r2.log
+              exit 1
+            fi
+          else
+            cat /tmp/apk-forge-r2.log
+          fi
+
+      - name: Deploy the APK FORGE API Worker
+        id: deploy
+        working-directory: cloudflare-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx wrangler deploy --config wrangler.toml 2>&1 | tee /tmp/apk-forge-deploy.log
+          URL=$(grep -Eo 'https://[A-Za-z0-9.-]+\.workers\.dev' /tmp/apk-forge-deploy.log | tail -n 1 || true)
+          if [ -z "$URL" ]; then
+            echo 'Could not automatically read the Worker URL from the deployment output.'
+            echo 'Open Cloudflare Dashboard > Workers & Pages > apk-forge-api.'
+          else
+            echo "worker_url=$URL" >> "$GITHUB_OUTPUT"
+            echo "APK FORGE Worker URL: $URL"
+          fi
+
+      - name: Add private secrets to the deployed Worker
+        working-directory: cloudflare-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          API_TOKEN_VALUE: ${{ secrets.API_TOKEN }}
+          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          CALLBACK_SECRET_VALUE: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$API_TOKEN_VALUE" || { echo 'Missing API_TOKEN repository secret.'; exit 1; }
+          test -n "$GH_DISPATCH_TOKEN" || { echo 'Missing GH_DISPATCH_TOKEN repository secret.'; exit 1; }
+          test -n "$CALLBACK_SECRET_VALUE" || { echo 'Missing CALLBACK_SECRET repository secret.'; exit 1; }
+          printf '%s' "$API_TOKEN_VALUE" | npx wrangler secret put API_TOKEN --config wrangler.toml
+          printf '%s' "$GH_DISPATCH_TOKEN" | npx wrangler secret put GITHUB_TOKEN --config wrangler.toml
+          printf '%s' "$CALLBACK_SECRET_VALUE" | npx wrangler secret put CALLBACK_SECRET --config wrangler.toml
+
+      - name: Check the deployed API
+        if: steps.deploy.outputs.worker_url != ''
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error "${{ steps.deploy.outputs.worker_url }}/health"
+          echo
+
+      - name: Show the final setup information
+        if: always()
+        run: |
+          echo 'Setup workflow finished. Check all earlier steps for green success marks.'
+          echo 'If deployment succeeded, copy the workers.dev URL printed in the Deploy step.'
+          echo 'In GitHub Settings > Secrets and variables > Actions > Variables, create WORKER_URL with that URL.'
+          echo 'Then upload frontend/index.html to your Netlify site and test /health.'
