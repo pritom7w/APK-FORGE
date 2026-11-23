@@ -15,33 +15,62 @@ jobs:
   install-and-deploy:
     if: ${{ inputs.confirm_deploy == 'DEPLOY' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
+      - name: Prepare permanent diagnostic log
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/apk-forge-diagnostics"
+          {
+            echo "APK FORGE INSTALLER DIAGNOSTIC"
+            echo "UTC time: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Branch: $GITHUB_REF_NAME"
+            echo "Runner: $RUNNER_OS"
+          } | tee "$RUNNER_TEMP/apk-forge-diagnostics/summary.txt"
+
       - name: Get the repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Check and extract the uploaded starter ZIP
+        shell: bash
         run: |
-          set -euo pipefail
-          test -f APK-FORGE-STARTER.zip || { echo 'APK-FORGE-STARTER.zip is missing from the repository root.'; exit 1; }
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/apk-forge-diagnostics/install.log") 2>&1
+          echo "[CHECK] Checking starter ZIP"
+          test -f APK-FORGE-STARTER.zip || { echo "ERROR: APK-FORGE-STARTER.zip is missing from repository root."; exit 1; }
           mkdir -p /tmp/apk-forge-package
+          unzip -t APK-FORGE-STARTER.zip
           unzip -q APK-FORGE-STARTER.zip -d /tmp/apk-forge-package
           test -f /tmp/apk-forge-package/cloudflare-worker/wrangler.toml
           test -f /tmp/apk-forge-package/.github/workflows/android-build.yml
           cp -a /tmp/apk-forge-package/. .
           rm -f APK-FORGE-STARTER.zip
+          echo "[OK] ZIP extracted and required files found"
 
       - name: Set Git identity and save extracted project files to GitHub
+        shell: bash
+        env:
+          GH_PUSH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/apk-forge-diagnostics/install.log") 2>&1
+          echo "[CHECK] Checking GitHub push token presence"
+          test -n "$GH_PUSH_TOKEN" || { echo "ERROR: GH_DISPATCH_TOKEN is missing."; exit 1; }
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           if git diff --cached --quiet; then
-            echo 'No repository file changes to commit.'
+            echo "[OK] No repository file changes to commit."
           else
             git commit -m 'Install APK FORGE backend and Android build workflow'
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            echo "[CHECK] Pushing extracted files using GH_DISPATCH_TOKEN"
+            AUTH_HEADER="$(printf 'x-access-token:%s' "$GH_PUSH_TOKEN" | base64 -w 0)"
+            git -c http.extraheader="AUTHORIZATION: basic ${AUTH_HEADER}" push origin "HEAD:${GITHUB_REF_NAME}"
+            unset AUTH_HEADER
+            echo "[OK] Extracted project files pushed to GitHub."
           fi
 
       - name: Install Node.js
@@ -49,19 +78,36 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Record tool versions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/apk-forge-diagnostics/install.log") 2>&1
+          node --version
+          npm --version
+          python3 --version
+          git --version
+
       - name: Install all backend dependencies
         working-directory: cloudflare-worker
-        run: npm install
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/apk-forge-diagnostics/install.log") 2>&1
+          npm install
+          echo "[OK] Backend dependencies installed."
 
       - name: Configure Cloudflare account and Netlify website
         working-directory: cloudflare-worker
         env:
           CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           NETLIFY_ORIGIN: ${{ secrets.ALLOWED_ORIGIN }}
+        shell: bash
         run: |
-          set -euo pipefail
-          test -n "$CF_ACCOUNT_ID" || { echo 'Missing CLOUDFLARE_ACCOUNT_ID repository secret.'; exit 1; }
-          test -n "$NETLIFY_ORIGIN" || { echo 'Missing ALLOWED_ORIGIN repository secret.'; exit 1; }
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/apk-forge-diagnostics/install.log") 2>&1
+          test -n "$CF_ACCOUNT_ID" || { echo "ERROR: Missing CLOUDFLARE_ACCOUNT_ID repository secret."; exit 1; }
+          test -n "$NETLIFY_ORIGIN" || { echo "ERROR: Missing ALLOWED_ORIGIN repository secret."; exit 1; }
           python3 - <<'PY'
           import os
           from pathlib import Path
@@ -71,22 +117,26 @@ jobs:
           text = text.replace('https://YOUR-NETLIFY-SITE.netlify.app', os.environ['NETLIFY_ORIGIN'])
           p.write_text(text)
           PY
+          echo "[OK] Cloudflare account and Netlify origin configured."
 
       - name: Create private R2 bucket if needed
         working-directory: cloudflare-worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        shell: bash
         run: |
-          set -euo pipefail
-          if ! npx wrangler r2 bucket create apk-forge-storage > /tmp/apk-forge-r2.log 2>&1; then
-            if grep -Eqi 'already exists|already in use|10006' /tmp/apk-forge-r2.log; then
-              echo 'The R2 bucket already exists. Continuing.'
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/apk-forge-diagnostics/install.log") 2>&1
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo "ERROR: Missing CLOUDFLARE_API_TOKEN repository secret."; exit 1; }
+          if ! npx wrangler r2 bucket create apk-forge-storage > "$RUNNER_TEMP/apk-forge-diagnostics/r2.log" 2>&1; then
+            if grep -Eqi 'already exists|already in use|10006' "$RUNNER_TEMP/apk-forge-diagnostics/r2.log"; then
+              echo "[OK] R2 bucket already exists. Continuing."
             else
-              cat /tmp/apk-forge-r2.log
+              cat "$RUNNER_TEMP/apk-forge-diagnostics/r2.log"
               exit 1
             fi
           else
-            cat /tmp/apk-forge-r2.log
+            cat "$RUNNER_TEMP/apk-forge-diagnostics/r2.log"
           fi
 
       - name: Deploy the APK FORGE API Worker
@@ -94,17 +144,18 @@ jobs:
         working-directory: cloudflare-worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        shell: bash
         run: |
-          set -euo pipefail
-          npx wrangler deploy --config wrangler.toml 2>&1 | tee /tmp/apk-forge-deploy.log
-          URL=$(grep -Eo 'https://[A-Za-z0-9.-]+\.workers\.dev' /tmp/apk-forge-deploy.log | tail -n 1 || true)
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/apk-forge-diagnostics/install.log") 2>&1
+          npx wrangler deploy --config wrangler.toml 2>&1 | tee "$RUNNER_TEMP/apk-forge-diagnostics/deploy.log"
+          URL=$(grep -Eo 'https://[A-Za-z0-9.-]+\.workers\.dev' "$RUNNER_TEMP/apk-forge-diagnostics/deploy.log" | tail -n 1 || true)
           if [ -z "$URL" ]; then
-            echo 'Could not automatically read the Worker URL from the deployment output.'
-            echo 'Open Cloudflare Dashboard > Workers & Pages > apk-forge-api.'
-          else
-            echo "worker_url=$URL" >> "$GITHUB_OUTPUT"
-            echo "APK FORGE Worker URL: $URL"
+            echo "ERROR: Could not automatically read the Worker URL from deployment output."
+            exit 1
           fi
+          echo "worker_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "APK FORGE Worker URL: $URL"
 
       - name: Add private secrets to the deployed Worker
         working-directory: cloudflare-worker
@@ -113,26 +164,75 @@ jobs:
           API_TOKEN_VALUE: ${{ secrets.API_TOKEN }}
           GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
           CALLBACK_SECRET_VALUE: ${{ secrets.CALLBACK_SECRET }}
+        shell: bash
         run: |
-          set -euo pipefail
-          test -n "$API_TOKEN_VALUE" || { echo 'Missing API_TOKEN repository secret.'; exit 1; }
-          test -n "$GH_DISPATCH_TOKEN" || { echo 'Missing GH_DISPATCH_TOKEN repository secret.'; exit 1; }
-          test -n "$CALLBACK_SECRET_VALUE" || { echo 'Missing CALLBACK_SECRET repository secret.'; exit 1; }
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/apk-forge-diagnostics/install.log") 2>&1
+          test -n "$API_TOKEN_VALUE" || { echo "ERROR: Missing API_TOKEN repository secret."; exit 1; }
+          test -n "$GH_DISPATCH_TOKEN" || { echo "ERROR: Missing GH_DISPATCH_TOKEN repository secret."; exit 1; }
+          test -n "$CALLBACK_SECRET_VALUE" || { echo "ERROR: Missing CALLBACK_SECRET repository secret."; exit 1; }
           printf '%s' "$API_TOKEN_VALUE" | npx wrangler secret put API_TOKEN --config wrangler.toml
           printf '%s' "$GH_DISPATCH_TOKEN" | npx wrangler secret put GITHUB_TOKEN --config wrangler.toml
           printf '%s' "$CALLBACK_SECRET_VALUE" | npx wrangler secret put CALLBACK_SECRET --config wrangler.toml
+          echo "[OK] Worker secrets configured. Secret values were not printed."
+
+      - name: Configure Android build workflow automatically
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          DEPLOYED_WORKER_URL: ${{ steps.deploy.outputs.worker_url }}
+          CALLBACK_SECRET_VALUE: ${{ secrets.CALLBACK_SECRET }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/apk-forge-diagnostics/install.log") 2>&1
+          test -n "$GH_TOKEN" || { echo "ERROR: GH_DISPATCH_TOKEN is missing."; exit 1; }
+          test -n "$DEPLOYED_WORKER_URL" || { echo "ERROR: Worker URL is missing."; exit 1; }
+          test -n "$CALLBACK_SECRET_VALUE" || { echo "ERROR: CALLBACK_SECRET is missing."; exit 1; }
+          gh secret set WORKER_CALLBACK_SECRET --repo "$GITHUB_REPOSITORY" --body "$CALLBACK_SECRET_VALUE"
+          gh variable set WORKER_URL --repo "$GITHUB_REPOSITORY" --body "$DEPLOYED_WORKER_URL"
+          echo "[OK] Android build workflow URL and callback secret configured in GitHub."
 
       - name: Check the deployed API
         if: steps.deploy.outputs.worker_url != ''
+        shell: bash
+        env:
+          WORKER_URL: ${{ steps.deploy.outputs.worker_url }}
         run: |
-          set -euo pipefail
-          curl --fail --silent --show-error "${{ steps.deploy.outputs.worker_url }}/health"
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/apk-forge-diagnostics/install.log") 2>&1
+          curl --fail --silent --show-error "$WORKER_URL/health" | tee "$RUNNER_TEMP/apk-forge-diagnostics/health.json"
           echo
+          echo "[OK] Worker health check passed."
+
+      - name: Write diagnostic summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo ""
+            echo "Workflow conclusion: ${{ job.status }}"
+            echo "Run URL: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Review install.log and the failed step above."
+          } >> "$RUNNER_TEMP/apk-forge-diagnostics/summary.txt"
+          if [ -f "$RUNNER_TEMP/apk-forge-diagnostics/install.log" ]; then
+            tail -n 80 "$RUNNER_TEMP/apk-forge-diagnostics/install.log" >> "$RUNNER_TEMP/apk-forge-diagnostics/summary.txt"
+          fi
+          cat "$RUNNER_TEMP/apk-forge-diagnostics/summary.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload permanent diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-forge-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/apk-forge-diagnostics/
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Show the final setup information
-        if: always()
+        if: success()
+        shell: bash
         run: |
-          echo 'Setup workflow finished. Check all earlier steps for green success marks.'
-          echo 'If deployment succeeded, copy the workers.dev URL printed in the Deploy step.'
-          echo 'In GitHub Settings > Secrets and variables > Actions > Variables, create WORKER_URL with that URL.'
-          echo 'Then upload frontend/index.html to your Netlify site and test /health.'
+          echo "APK FORGE setup workflow finished successfully."
+          echo "The Worker URL and WORKER_CALLBACK_SECRET were configured automatically."
+          echo "Next: test the Netlify frontend with your API_TOKEN."
