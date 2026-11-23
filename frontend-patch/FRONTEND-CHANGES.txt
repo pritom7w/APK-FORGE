@@ -1,0 +1,45 @@
+Apply these changes to your existing Netlify index.html. They are required for the supplied Worker API.
+
+CHANGE 1: Accept the backend's completed status and resolve relative download URLs.
+Find this part inside poll():
+
+if(['success','complete'].includes(d.status)){finish(d.downloadUrl);return}
+
+Replace it with:
+
+if(['success','complete','completed'].includes(d.status)){if(d.downloadUrl)finish(new URL(d.downloadUrl,base).toString());return}
+
+CHANGE 2: Do not let event() finish the download before poll() resolves the URL.
+Find inside event():
+
+if(d.downloadUrl)finish(d.downloadUrl)
+
+Replace with:
+
+if(d.downloadUrl)log('APK is ready. Preparing authenticated download...')
+
+CHANGE 3: Replace the existing finish(url) function with this authenticated download function:
+
+async function finish(url){stop();$('status').textContent='SUCCESS';progress(100,'Build completed');$('build').disabled=false;$('stop').disabled=true;log('APK build completed');if(!url)return;try{let headers={};if($('token').value)headers.Authorization='Bearer '+$('token').value;let r=await fetch(url,{headers});if(!r.ok)throw Error('APK download failed: HTTP '+r.status);let blob=await r.blob();let objectUrl=URL.createObjectURL(blob);let a=document.createElement('a');a.href=objectUrl;a.download='APK-FORGE-build.apk';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(objectUrl),60000);$('output').textContent='APK download started. Check your Android Downloads folder.';log('Authenticated APK download started')}catch(e){$('output').textContent=e.message;log(e.message)}}
+
+CHANGE 4: Display server-side build logs in the log panel.
+Inside event(d,base,id,headers), add this after the opening brace:
+
+if(Array.isArray(d.logs)){let old=window.lastServerLogCount||0;d.logs.slice(old).forEach(x=>log(x));window.lastServerLogCount=d.logs.length}
+
+Also reset the counter when a new build starts, immediately before fetch(base+'/build'...):
+
+window.lastServerLogCount=0;
+
+CHANGE 5: Do not persist the bearer token in browser localStorage.
+In the Save button handler, remove:
+
+localStorage.setItem('forgeToken',$('token').value);
+
+In onload, remove:
+
+if(localStorage.forgeToken)$('token').value=localStorage.forgeToken;
+
+The token should be entered for the session and not saved in localStorage. Keep the Netlify site access restricted because this starter uses a shared single-owner API token.
+
+IMPORTANT: The current Worker only supports native Android Gradle ZIP projects with gradlew, Debug APK, and status polling. Choose Debug APK and Auto detect or Android Gradle. Flutter, NDK, React Native, release signing, and SSE are not implemented.

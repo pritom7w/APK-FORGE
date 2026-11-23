@@ -1,0 +1,162 @@
+name: APK FORGE Android Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Cloudflare job ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-forge-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  fetch-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download source ZIP from private Worker endpoint
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CALLBACK_SECRET: ${{ secrets.WORKER_CALLBACK_SECRET }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          set -euo pipefail
+          test -n "$WORKER_URL" && test -n "$CALLBACK_SECRET"
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $CALLBACK_SECRET" \
+            "$WORKER_URL/internal/jobs/$JOB_ID/source" -o source.zip
+          test -s source.zip
+          curl --fail --silent --show-error -X POST "$WORKER_URL/internal/jobs/$JOB_ID/status" \
+            -H "Authorization: Bearer $CALLBACK_SECRET" -H 'Content-Type: application/json' \
+            --data '{"status":"building","progress":5,"stage":"Source downloaded"}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-forge-source
+          path: source.zip
+          retention-days: 1
+
+  build:
+    needs: fetch-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk-forge-source
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android SDK command line tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip zip
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdline-tools.zip
+          unzip -q /tmp/cmdline-tools.zip -d /tmp/android-cmdline
+          mv /tmp/android-cmdline/cmdline-tools "$HOME/android-sdk/cmdline-tools/latest"
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$HOME/android-sdk/platform-tools" >> "$GITHUB_PATH"
+          yes | "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+      - name: Safely extract and build native Android Gradle project
+        id: compile
+        continue-on-error: true
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/build-engine/safe_extract.py" source.zip workspace
+          python3 "$GITHUB_WORKSPACE/build-engine/find_gradle_project.py" workspace > project-root.txt
+          ROOT="$(cat project-root.txt)"
+          echo "Detected project root: $ROOT"
+          cd "$ROOT"
+          if [ ! -f ./gradlew ]; then echo "No Gradle wrapper (gradlew) found. This build runner currently requires a Gradle wrapper."; exit 2; fi
+          chmod +x ./gradlew
+          TASK="assembleDebug"
+          if [ "${{ github.event.inputs.job_id }}" = "" ]; then exit 2; fi
+          ./gradlew --no-daemon --stacktrace "$TASK" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          find . -type f -path '*/build/outputs/apk/*/*.apk' -print -exec cp {} "$GITHUB_WORKSPACE/output/" \;
+          test "$(find "$GITHUB_WORKSPACE/output" -maxdepth 1 -name '*.apk' | wc -l)" -gt 0
+      - name: Upload build output and logs for publisher
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-forge-result
+          path: |
+            output/*.apk
+            build.log
+            project-root.txt
+          if-no-files-found: warn
+          retention-days: 1
+      - name: Preserve build result
+        if: steps.compile.outcome == 'failure'
+        run: exit 1
+
+  publish:
+    if: always() && needs.fetch-source.result == 'success'
+    needs: [fetch-source, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk-forge-result
+          path: result
+        continue-on-error: true
+      - name: Publish APK to private R2 through the Worker
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CALLBACK_SECRET: ${{ secrets.WORKER_CALLBACK_SECRET }}
+          JOB_ID: ${{ inputs.job_id }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+          mkdir -p result
+          if [ "$BUILD_RESULT" != "success" ]; then
+            BODY='{"status":"failed","progress":100,"stage":"Build failed","error":"GitHub Actions build job failed. Open the workflow run for full diagnostics."}'
+            curl --fail --silent --show-error -X POST "$WORKER_URL/internal/jobs/$JOB_ID/status" \
+              -H "Authorization: Bearer $CALLBACK_SECRET" -H 'Content-Type: application/json' --data "$BODY"
+            exit 0
+          fi
+          APK=$(find result -type f -name '*.apk' -print -quit)
+          if [ -z "$APK" ]; then
+            curl --fail --silent --show-error -X POST "$WORKER_URL/internal/jobs/$JOB_ID/status" \
+              -H "Authorization: Bearer $CALLBACK_SECRET" -H 'Content-Type: application/json' \
+              --data '{"status":"failed","progress":100,"stage":"APK missing","error":"Build completed but no APK artifact was found."}'
+            exit 0
+          fi
+          curl --fail --silent --show-error -X PUT "$WORKER_URL/internal/jobs/$JOB_ID/artifact" \
+            -H "Authorization: Bearer $CALLBACK_SECRET" \
+            -H 'Content-Type: application/vnd.android.package-archive' \
+            --data-binary "@$APK"
+
+
+  report-fetch-failure:
+    if: always() && needs.fetch-source.result == 'failure'
+    needs: [fetch-source]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report source-fetch failure
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CALLBACK_SECRET: ${{ secrets.WORKER_CALLBACK_SECRET }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          curl --silent --show-error -X POST "$WORKER_URL/internal/jobs/$JOB_ID/status" \
+            -H "Authorization: Bearer $CALLBACK_SECRET" -H 'Content-Type: application/json' \
+            --data '{"status":"failed","progress":100,"stage":"Source download failed","error":"GitHub Actions could not download the source archive. Check the workflow run."}' || true
